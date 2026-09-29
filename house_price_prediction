@@ -1,0 +1,296 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+
+try:
+    display
+except NameError:          # running as a plain script
+    display = print
+
+sns.set_theme(style="whitegrid")
+pd.options.display.float_format = "{:,.3f}".format
+pd.options.display.max_columns = 30
+RANDOM_STATE = 42
+DATA_PATH = "data.csv"
+
+# %% [markdown]
+# ## 1. Load Data & Exploratory Data Analysis
+
+# %%
+df = pd.read_csv(DATA_PATH)
+print("Shape:", df.shape)
+df.head()
+
+# %%
+print("Data types:\n", df.dtypes, "\n")
+missing = df.isnull().sum().to_frame("missing")
+missing["pct"] = missing["missing"] / len(df) * 100
+print("Missing values (NaN) per column:")
+display(missing)
+
+# %%
+df.describe().T
+
+# %% [markdown]
+# **Observation:** There are no `NaN` values, but the data has *hidden* quality problems that behave like missing/invalid values. Let's look for them.
+
+# %%
+print("Rows with price == 0      :", (df["price"] == 0).sum())
+print("Rows with bedrooms == 0   :", (df["bedrooms"] == 0).sum())
+print("Rows with bathrooms == 0  :", (df["bathrooms"] == 0).sum())
+print("Rows with yr_renovated == 0:", (df["yr_renovated"] == 0).sum(), "(0 means 'never renovated', not a year)")
+print("\nMost expensive houses:")
+display(df.nlargest(5, "price")[["price", "sqft_living", "bedrooms", "city"]])
+
+# %% [markdown]
+# **Findings**
+# * 49 houses have `price = 0` — these are invalid sale records, not real prices, and would badly distort the model. They must be removed.
+# * A handful of houses have 0 bedrooms/bathrooms, which is implausible.
+# * `yr_renovated = 0` is a code for "never renovated" — it must **not** be treated as the year 0.
+# * There are extreme price outliers (e.g. a 1,180 sqft house listed at $26.6M), which are almost certainly data errors and would dominate a squared-error model.
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+sns.histplot(df["price"], bins=80, kde=True, ax=axes[0], color="steelblue")
+axes[0].set_title("Price distribution (raw, incl. invalid rows & outliers)")
+sns.boxplot(x=df["price"], ax=axes[1], color="lightcoral")
+axes[1].set_title("Price boxplot")
+plt.tight_layout(); plt.show()
+print(f"Skewness of raw price: {df['price'].skew():.2f}")
+
+# %% [markdown]
+# ## 2. Feature Selection Discussion
+#
+# | Feature | Decision | Reasoning |
+# |---|---|---|
+# | **sqft_living** | ✅ Keep | Living area is normally the strongest driver of price. |
+# | **city** (location) | ✅ Keep (One-Hot) | Location drives price: Mercer Island / Bellevue / Kirkland vs Kent / Federal Way. Cities with fewer than 30 sales are grouped as `Other` to avoid unstable dummies. |
+# | **bedrooms, bathrooms** | ✅ Keep | More rooms → larger, more functional home. Correlated with sqft_living, so their *extra* effect is smaller. |
+# | **age** (from `yr_built`) | ✅ Keep | Built as `2014 − yr_built`; the sales are all in 2014. Age is more meaningful than a raw year. |
+# | **renovated** (from `yr_renovated`) | ✅ Keep | Turned into a 0/1 flag because the raw column is mostly 0. |
+# | **waterfront, view, condition, floors, sqft_lot, sqft_basement** | ✅ Keep | Each has a clear real-world link to value (premium features, quality, plot size). |
+# | **sqft_above** | ❌ Drop | `sqft_above + sqft_basement = sqft_living` exactly — keeping all three creates perfect multicollinearity. |
+# | **date** | ❌ Drop | Only ~2 months of sales, so almost no price signal. |
+# | **street** | ❌ Drop | Unique for almost every row (4,525 values); would just memorise houses. |
+# | **statezip** | ❌ Drop | A 77-value duplicate of `city` information; `city` is used instead. |
+# | **country** | ❌ Drop | Constant ("USA") — no information. |
+
+# %% [markdown]
+# ## 3. Cleaning, Missing Values & Encoding
+#
+# Steps:
+# 1. Remove invalid rows: `price ≤ 0`, `bedrooms = 0`, `bathrooms = 0`.
+# 2. Remove **extreme** price outliers using the 3×IQR rule (very conservative; only obvious errors go).
+# 3. Engineer `age` and `renovated`; group rare cities into `Other`.
+# 4. Inside a scikit-learn `Pipeline` (fitted on the **training set only**, so no data leakage): median/most-frequent imputation as a safety net, `StandardScaler` for numeric features and `OneHotEncoder(drop="first")` for `city`.
+
+# %%
+n_before = len(df)
+data = df[(df["price"] > 0) & (df["bedrooms"] > 0) & (df["bathrooms"] > 0)].copy()
+print(f"Removed invalid rows (price/bed/bath = 0): {n_before - len(data)}")
+
+q1, q3 = data["price"].quantile([0.25, 0.75])
+upper = q3 + 3 * (q3 - q1)
+n_mid = len(data)
+data = data[data["price"] <= upper].copy()
+print(f"Removed extreme price outliers (> ${upper:,.0f}): {n_mid - len(data)}")
+
+data["age"] = 2014 - data["yr_built"]
+data["renovated"] = (data["yr_renovated"] > 0).astype(int)
+
+city_counts = data["city"].value_counts()
+data["city_grp"] = data["city"].where(data["city"].map(city_counts) >= 30, "Other")
+
+print(f"\nRows kept: {len(data)} of {n_before}   |   city groups: {data['city_grp'].nunique()}")
+print(f"Skewness of cleaned price: {data['price'].skew():.2f}")
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+sns.histplot(data["price"], bins=60, kde=True, ax=axes[0], color="seagreen")
+axes[0].set_title("Price distribution after cleaning")
+order = data.groupby("city_grp")["price"].median().sort_values(ascending=False).head(12).index
+sns.boxplot(data=data[data["city_grp"].isin(order)], x="price", y="city_grp", order=order, ax=axes[1], color="skyblue")
+axes[1].set_title("Price by city (top 12 by median)")
+plt.tight_layout(); plt.show()
+
+# %%
+num_features = ["sqft_living", "sqft_lot", "bedrooms", "bathrooms", "floors", "waterfront",
+                "view", "condition", "sqft_basement", "age", "renovated"]
+cat_features = ["city_grp"]
+
+X = data[num_features + cat_features]
+y = data["price"]
+
+numeric_pipe = Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())])
+categorical_pipe = Pipeline([("impute", SimpleImputer(strategy="most_frequent")),
+                             ("ohe", OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False))])
+preprocessor = ColumnTransformer([("num", numeric_pipe, num_features),
+                                  ("cat", categorical_pipe, cat_features)])
+
+# %% [markdown]
+# ## 4. Correlation Heatmap
+
+# %%
+corr = data[num_features + ["price"]].corr()
+plt.figure(figsize=(10, 8))
+sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", center=0, square=True)
+plt.title("Correlation Heatmap (numeric features vs price)"); plt.show()
+
+print("Correlation with price (strongest first):")
+print(corr["price"].drop("price").sort_values(key=abs, ascending=False).round(3).to_string())
+
+# %% [markdown]
+# **Reading the heatmap:** `sqft_living` is the feature most correlated with price (≈0.66), followed by `bathrooms` (≈0.51), `bedrooms`, `view`, `sqft_basement` and `floors`. `age`, `renovated` and `condition` have very weak *linear* correlation with price. Note also the strong correlation between `sqft_living`, `bathrooms` and `bedrooms` — this multicollinearity will affect individual coefficients later.
+
+# %% [markdown]
+# ## 5. Train / Test Split (80 / 20)
+
+# %%
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
+print(f"Train: {X_train.shape[0]} rows | Test: {X_test.shape[0]} rows")
+
+# %% [markdown]
+# ## 6. Train Linear Regression
+
+# %%
+lr_model = Pipeline([("prep", preprocessor), ("reg", LinearRegression())])
+lr_model.fit(X_train, y_train)
+y_pred = lr_model.predict(X_test)
+
+# %% [markdown]
+# ## 7. Evaluation: MSE, RMSE, R²
+
+# %%
+def evaluate(model, name):
+    rows = {}
+    for split, Xs, ys in [("Train", X_train, y_train), ("Test", X_test, y_test)]:
+        p = model.predict(Xs)
+        mse = mean_squared_error(ys, p)
+        rows[split] = {"MSE": mse, "RMSE": np.sqrt(mse), "R2": r2_score(ys, p)}
+    return pd.DataFrame(rows).T.rename_axis(name)
+
+results_lr = evaluate(lr_model, "Linear Regression")
+display(results_lr)
+print(f"Average house price in test set: ${y_test.mean():,.0f}  |  Test RMSE is {np.sqrt(mean_squared_error(y_test, y_pred)) / y_test.mean():.0%} of it")
+
+# %% [markdown]
+# **Interpretation:** The model explains roughly **70% of the variance** in house prices on unseen data (test R² ≈ 0.70). The test RMSE is about **$144k**, i.e. a typical prediction is off by roughly that amount (RMSE is in the same unit as price, and squares large errors so expensive homes weigh heavily). Train and test scores are very close, so the model is **not overfitting**; the remaining error is mostly due to information the dataset does not contain (interior quality, exact street/neighbourhood, lot desirability, etc.).
+
+# %% [markdown]
+# ## 8. Actual vs Predicted
+
+# %%
+plt.figure(figsize=(7, 6.5))
+plt.scatter(y_test, y_pred, alpha=0.5, edgecolor="k", linewidth=0.3)
+lims = [min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())]
+plt.plot(lims, lims, "r--", label="Perfect prediction")
+plt.xlabel("Actual Price ($)"); plt.ylabel("Predicted Price ($)")
+plt.title("Actual vs Predicted House Prices (Linear Regression)")
+plt.legend(); plt.show()
+
+# %% [markdown]
+# Points follow the red diagonal reasonably well for typical houses. The spread grows for expensive houses, which is the price-scale effect examined in the residual plot.
+
+# %% [markdown]
+# ## 9. Residual Analysis
+
+# %%
+residuals = y_test - y_pred
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+axes[0].scatter(y_pred, residuals, alpha=0.5, edgecolor="k", linewidth=0.3)
+axes[0].axhline(0, color="r", linestyle="--")
+axes[0].set_xlabel("Predicted Price ($)"); axes[0].set_ylabel("Residual ($)")
+axes[0].set_title("Residuals vs Predicted")
+sns.histplot(residuals, kde=True, ax=axes[1], color="seagreen")
+axes[1].set_title("Residual Distribution")
+plt.tight_layout(); plt.show()
+print(f"Mean residual: ${residuals.mean():,.0f}   (close to 0 → no overall bias)")
+
+# %% [markdown]
+# **Interpretation:** Residuals are centred near zero (no overall bias) and roughly bell-shaped, but the residual plot shows a **funnel shape** — errors get larger as predicted price rises (heteroscedasticity). This means the model's linearity/constant-variance assumption is only partly satisfied for raw prices. A common idea is to model **log(price)**, which we test in the extra section at the end.
+
+# %% [markdown]
+# ## 10. Coefficient Analysis
+
+# %%
+feature_names = [n.split("__")[1] for n in lr_model.named_steps["prep"].get_feature_names_out()]
+baseline_city = lr_model.named_steps["prep"].named_transformers_["cat"].named_steps["ohe"].categories_[0][0]
+coefs = pd.Series(lr_model.named_steps["reg"].coef_, index=feature_names)
+
+print("Numeric features (per +1 standard deviation), sorted:")
+display(coefs[num_features].sort_values(ascending=False).round(0).to_frame("coefficient ($)"))
+
+top = pd.concat([coefs.sort_values().head(8), coefs.sort_values().tail(12)])
+plt.figure(figsize=(9, 8))
+top.plot(kind="barh", color=["indianred" if c < 0 else "steelblue" for c in top])
+plt.axvline(0, color="k", lw=0.8)
+plt.title("Most negative and most positive coefficients")
+plt.xlabel("Effect on price ($)"); plt.tight_layout(); plt.show()
+print(f"City coefficients are relative to the baseline city: {baseline_city}")
+
+# %% [markdown]
+# **Interpretation**
+# * **Highest positive impact:** `sqft_living` is the biggest numeric driver (one standard deviation ≈ +$170k). Location is huge: cities such as **Mercer Island, Bellevue, Kirkland, Redmond and Seattle** carry the largest premiums over the baseline city.
+# * `view`, `bathrooms` and `condition` add value as expected.
+# * **Negative / surprising signs:** `bedrooms` is negative and `sqft_basement` is negative. This is *multicollinearity*, not "bedrooms reduce price": once total living area is fixed, cramming in more bedrooms means smaller rooms, and basement area is already part of `sqft_living`.
+# * `age` has a *positive* coefficient here: after controlling for city and size, older houses are not cheaper in this sample (older homes tend to sit in established, desirable areas and on valuable land). Treat this as an association, not a causal effect.
+# * Numeric coefficients are per standard deviation, so they are directly comparable; city coefficients are relative to the baseline city printed above.
+
+# %% [markdown]
+# ## 11. (Bonus) Ridge & Lasso vs Linear Regression
+
+# %%
+models = {
+    "Linear Regression": lr_model,
+    "Ridge (CV)": Pipeline([("prep", preprocessor), ("reg", RidgeCV(alphas=np.logspace(-2, 3, 30)))]),
+    "Lasso (CV)": Pipeline([("prep", preprocessor), ("reg", LassoCV(cv=5, random_state=RANDOM_STATE, max_iter=50000))]),
+}
+rows = []
+for name, m in models.items():
+    m.fit(X_train, y_train)
+    p = m.predict(X_test)
+    mse = mean_squared_error(y_test, p)
+    rows.append({"Model": name, "MSE": mse, "RMSE": np.sqrt(mse), "R2": r2_score(y_test, p)})
+compare = pd.DataFrame(rows).set_index("Model")
+display(compare)
+
+print(f"Best Ridge alpha: {models['Ridge (CV)'].named_steps['reg'].alpha_:.3f}")
+print(f"Best Lasso alpha: {models['Lasso (CV)'].named_steps['reg'].alpha_:.1f}")
+lasso_coefs = pd.Series(models["Lasso (CV)"].named_steps["reg"].coef_, index=feature_names)
+print("Features Lasso set to exactly zero:", list(lasso_coefs[lasso_coefs == 0].index))
+
+# %% [markdown]
+# **Takeaway:** Ridge and Lasso perform almost identically to plain Linear Regression here (R² ≈ 0.70). With ~4,500 rows and only ~36 features, overfitting is not a problem, so regularisation has little to fix. Lasso does act as automatic feature selection by driving the weakest coefficients to zero (listed above).
+
+# %% [markdown]
+# ## 12. (Extra) Log-transformed price
+
+# %%
+log_model = TransformedTargetRegressor(
+    regressor=Pipeline([("prep", preprocessor), ("reg", LinearRegression())]),
+    func=np.log1p, inverse_func=np.expm1)
+log_model.fit(X_train, y_train)
+p_log = log_model.predict(X_test)
+
+extra = pd.DataFrame({
+    "Linear (raw price)": [np.sqrt(mean_squared_error(y_test, y_pred)), r2_score(y_test, y_pred)],
+    "Linear (log price)": [np.sqrt(mean_squared_error(y_test, p_log)), r2_score(y_test, p_log)],
+}, index=["RMSE ($)", "R2"]).T
+display(extra)
+
+res_log = y_test - p_log
+plt.figure(figsize=(7, 4.5))
+plt.scatter(p_log, res_log, alpha=0.5, edgecolor="k", linewidth=0.3)
+plt.axhline(0, color="r", linestyle="--")
+plt.xlabel("Predicted Price ($)"); plt.ylabel("Residual ($)"); plt.title("Residuals: log-price model")
+plt.show()
